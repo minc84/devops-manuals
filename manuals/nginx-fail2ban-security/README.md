@@ -1,228 +1,247 @@
-# Безопасность без бюджета: пошаговое руководство по защите веб-сервера силами Nginx и Fail2ban
+# Развертывание SAP NetWeaver 7.52 SP04 ABAP Developer Edition
 
-Практическое руководство по настройке защиты веб-сервера от распространенных сетевых угроз, перебора паролей и DDoS-атак с использованием бесплатного стандартного стека инструментов.
+> «Ну-ка, давай-ка, поглядим, как тут избы делают...»
 
-## Линия обороны 1. Nginx как умный забор
+Помните этот момент из мультфильма, когда Вовка открывает книгу «Сделай сам»? Примерно с таким же выражением лица я начинал деплой **SAP NetWeaver 7.52 SP04 ABAP Developer Edition** на чистую ОС внутри KVM (openSUSE Leap 15.3). Увидел где-то системные требования SAP и решил посмотреть, что это за зверь.
 
-Веб-сервер Nginx позволяет эффективно отбивать атаки на подлете, ограничивать скорость запросов и маскировать системные данные от сканеров.
+Задумка была в том, чтобы развернуть полноценный, независимый enterprise-контур «на белую», полностью своими руками, без готовых Docker или Vagrant контейнеров.
 
-### Настройки в глобальном блоке http (Файл nginx.conf)
+---
 
-```nginx
-http {
-    # 1. МАСКИРОВКА: Скрываем точную версию Nginx, лишая хакеров первой подсказки
-    server_tokens off; 
+## Исходные данные хоста
 
-    # 2. ЗАЩИТА ПАМЯТИ: Жестко ограничиваем размер загрузок до 10 МБ
-    client_body_buffer_size      128k;
-    client_header_buffer_size    1k;
-    client_max_body_size         10M; 
+| Параметр | Значение |
+|---|---|
+| Хост-машина | Ubuntu 24.04 (20 ядер CPU, 64 GB RAM) |
+| Гипервизор | KVM (Virt-Manager) |
+| Ресурсы под прод-проект | 16 GB RAM, 4 ядра CPU, диск VirtIO (`/dev/vda`) на 350 GB |
 
-    # 3. ТАЙМАУТЫ: Если клиент подключился и молчит 10 секунд — отключаем его (Защита от Slowloris)
-    client_body_timeout          10;
-    client_header_timeout        10;
+> В будущем планирую докинуть туда еще HANA Express.
 
-    # 4. АНТИ-DDOS: Считаем скорость кликов с одного IP-адреса
-    limit_req_zone $binary_remote_addr zone=site_limit:10m rate=10r/s;  # Для всего сайта: не более 10 запр/сек
-    limit_req_zone $binary_remote_addr zone=login_limit:10m rate=2r/m;  # Для входа: не более 2 попыток в минуту
-} 
+---
+
+## Разметка диска в инсталляторе openSUSE
+
+Чтобы SAP не упирался в искусственные лимиты отдельных папок, не стал городить сложную структуру LVM-разделов, а создал простую и надежную схему:
+
+| Раздел | Размер | Назначение |
+|---|---|---|
+| `/dev/vda1` | 500 MB | EFI-раздел для загрузки системы |
+| `/dev/vda2` | 30 GB | Выделенный раздел подкачки **Swap** |
+| `/dev/vda3` | остаток | Основной раздел, XFS, смонтирован под `/` |
+
+> **Важно:** SAP NetWeaver крайне требователен к Swap. Его размер должен быть **не менее двух объемов RAM** виртуалки, иначе инсталлятор выбросит ошибку на старте.
+
+Благодаря файловой системе **XFS** Linux отлично справляется с огромными многогигабайтными файлами баз данных Sybase ASE (файлы данных `*.dat`), обеспечивая максимальную скорость работы дисковой подсистемы на KVM.
+
+---
+
+## Критически важный выбор ОС: только openSUSE Leap 15.3!
+
+> **Не пытайтесь ставить систему на современные дистрибутивы** (openSUSE 15.6, Ubuntu 24.04 и т.д.) — вы убьете кучу времени, как изначально сделал я.
+
+**Причина:** В новых дистрибутивах установлена библиотека `glibc 2.39+`. Из-за изменений в формате вывода системных утилит ядра инсталлятор SAP не может корректно распарсить текстовый ответ от базы данных, путается в цифрах, ошибочно принимает версию СУБД за `15.7.0.000` и аварийно завершает работу. Поэтому строго **openSUSE Leap 15.3**!
+
+---
+
+## Предварительная настройка ОС (под пользователем root)
+
+### 1. Сетевое имя и статический IP
+
+Инсталлятор SAP завязан на жесткое сетевое имя хоста. Задаем имя машины `vhcalnplci` и принудительно прописываем статический IP в файл `/etc/hosts` (иначе система не заведется):
+
+```text
+192.168.122.232    vhcalnplci    vhcalnplci.local
 ```
 
-### Настройки внутри блока сайта server (Файл конфигурации домена)
+### 2. Тюнинг лимитов ядра и оперативной памяти
 
-```nginx
-server {
-    listen 443 ssl;
-    server_name test.by; # Укажите здесь ваш домен
+Чтобы система не падала с ошибками нехватки дескрипторов и памяти, добавляем в самый конец файла `/etc/security/limits.conf`:
 
-    # 5. HTTP-ЗАГОЛОВКИ БЕЗОПАСНОСТИ
-    add_header X-Frame-Options "SAMEORIGIN" always; # Защита от кликджекинга
-    add_header X-Content-Type-Options "nosniff" always; # Запрет браузеру угадывать тип файла
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always; # Скрытие путей перехода
-    add_header Permissions-Policy "camera=(), microphone=()" always; # Блокировка доступа к девайсам
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always; # Принудительный HTTPS
-    
-    # Контроль CORS (заменяем trust.by на конкретного доверенного партнера)
-    add_header Access-Control-Allow-Origin "https://trust.by";
+```text
+npladm          hard    memlock         unlimited
+npladm          soft    memlock         unlimited
+sybnpl          hard    memlock         unlimited
+sybnpl          soft    memlock         unlimited
+npladm          hard    nofile          65536
+npladm          soft    nofile          65536
+sybnpl          hard    nofile          65536
+sybnpl          soft    nofile          65536
+```
 
-    # Политика CSP (Разрешаем скрипты только от себя, Яндекса и Google)
-    add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' *.test.by *.yandex.ru *.google.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; frame-ancestors 'self';" always;
+Открываем файл `/etc/sysctl.conf` и выставляем официальный лимит областей памяти согласно **SAP Note 900929** (в исходной конфигурации стоял 1 миллион, что может вызвать дампы при тяжелых транзакциях, меняем строго на 2 миллиона):
 
-    # Защита сессионных кук от кражи скриптами
-    proxy_cookie_path / "/; HTTPOnly; Secure; SameSite=Strict";
+```text
+vm.max_map_count=2000000
+```
 
-    # Применяем общий лимит кликов на весь сайт
-    limit_req zone=site_limit burst=20 nodelay;
+Применяем настройки ядра «на лету»:
 
-    location / {
-        proxy_pass http://localhost:3000; # Путь к вашему приложению
-        
-        # Блокировка известных хакерских утилиты-сканеров по имени (User-Agent)
-        if ($http_user_agent ~* (sqlmap|nikto|dirbuster|nmap)) {
-            return 403;
-        }
-    }
+```bash
+sysctl -p
+```
 
-    # Защита админки WordPress (включаем жесткий лимит — не более 2 попыток в минуту)
-    location = /wp-login.php {
-        limit_req zone=login_limit burst=5 nodelay;
-        proxy_pass http://localhost:3000/login;
-    }
+### 3. Доустановка системных пакетов и UUID-демона
 
-    # Запрет на выполнение любых программных скриптов в папке загрузок пользователя
-    location /uploads/ {
-        location ~ \.(php|pl|py|jsp|sh|cgi|exe)$ {
-            deny all;
-            return 403;
-        }
-    }
-}
+Отключаем опрос установочного CD-ROM, обновляем репозитории и ставим обязательный для SAP демон генерации уникальных идентификаторов `uuidd`, а также архиватор `unrar`:
+
+```bash
+zypper mr -d 1
+zypper ref && zypper update -y
+zypper install -y uuidd unrar
+systemctl enable --now uuidd
 ```
 
 ---
 
-## Линия обороны 2. Фильтрация трафика (WAF)
+## Подготовка дистрибутива и запуск установки
 
-Если злоумышленник действует аккуратно и не превышает лимиты запросов, но отправляет SQL-инъекцию или XSS-нагрузку, стандартный Nginx это пропустит. Для глубокого анализа трафика встраивается бесплатный модуль Coraza WAF с набором правил OWASP Core Rule Set (CRS).
-
-### Установка модуля Coraza WAF для Nginx (Ubuntu/Debian)
+Копируем по SCP все 11 томов RAR-архива дистрибутива на виртуалку в папку `/root/sap`. Чтобы распаковать весь многотомник, достаточно запустить извлечение только первого тома:
 
 ```bash
-sudo add-apt-repository ppa:coraza/nginx -y
-sudo apt update
-sudo apt install libnginx-mod-http-coraza -y
-```
-
-*Примечание:* Для активации модуля необходимо добавить строку `load_module modules/ngx_http_coraza_module.so;` в самый верх глобального конфигурационного файла `nginx.conf`.
-
-### Загрузка пака правил OWASP CRS через терминал
-
-```bash
-cd /etc/nginx/coraza/
-sudo git clone https://github.com owasp-crs
-sudo cp owasp-crs/crs-setup.conf.example owasp-crs/crs-setup.conf 
-```
-
-### Настройки в файле конфигурации файрвола /etc/nginx/coraza/coraza.conf
-
-```ini
-# Включаем WAF в боевой режим (On — блокировать атаки, DetectionOnly — только записывать в лог)
-SecRuleEngine On
-SecRequestBodyAccess On
-SecResponseBodyAccess On
-SecAuditLog /var/log/nginx/coraza_audit.log
-
-# Подключаем скачанный пак правил OWASP CRS одной строчкой
-Include /etc/nginx/coraza/owasp-crs/crs-setup.conf
-Include /etc/nginx/coraza/owasp-crs/rules/*.conf
-```
-
-После сохранения настроек проверьте конфигурацию и перезапустите веб-сервер:
-
-```bash
-sudo nginx -t  # Проверка конфигурации
-sudo systemctl reload nginx  # Перезагрузка
+cd /root/sap/
+unrar x TD752SP04part01.rar
 ```
 
 ---
 
-## Линия обороны 3. Fail2ban как автоматический охранник
+## Главный маневр: Подмена протухшей лицензии СУБД
 
-Fail2ban анализирует системные логи веб-сервера в реальном времени. Если один и тот же IP-адрес совершает серию подозрительных действий или перебирает пароли, утилита автоматически блокирует его на уровне сетевого экрана.
+Официальный дистрибутив содержит встроенный шаблон лицензии Sybase ASE, который намертво протух еще в 2021 году. Из-за этого в самом конце установки инсталлятор падает на шаге сброса паролей СУБД с ошибкой:
 
-### Установка Fail2ban через терминал
+```text
+Unable to generate a new password for database login 'sa'
+```
 
 ```bash
-sudo apt update
-sudo apt install fail2ban -y
-sudo systemctl enable fail2ban
-sudo systemctl start fail2ban 
+chmod +x install.sh
+./install.sh
 ```
 
-### Шаг 1. Создание фильтра уязвимостей
+### Как лечится
 
-Создайте файл `/etc/fail2ban/filter.d/nginx-bf.conf` со следующим содержимым:
+Ключ берем тут: [SAP Trials & Downloads](https://www.sap.com/products/try-sap/trials-downloads.html)
 
-```ini
-[Definition]
-# Замечаем IP, которые получили ошибку 401 (неверный пароль) на странице входа
-failregex = ^<HOST> -.*"POST .*/login.*" 401
-# Замечаем ботов, сканирующих сайт в поисках стандартных лазеек WordPress
-            ^<HOST> -.*"GET .*wpad.dat.*" 404
-            ^<HOST> -.*"GET .*wp-admin.*" 404 
-```
+Запускаем установку через `./install.sh`, принимаем соглашение (`yes`) и задаем **Master Password**. Как только инсталлятор создаст рабочие папки СУБД и упадет на шаге паролей `sa`, папка лицензий уже будет физически существовать на диске!
 
-### Шаг 2. Настройка логики блокировки
-
-Добавьте конфигурацию тюрьмы (jail) в файл `/etc/fail2ban/jail.local`:
-
-```ini
-[nginx-bf]
-enabled  = true
-port     = http,https
-filter   = nginx-bf
-logpath  = /var/log/nginx/access.log   
-maxretry = 5                           # Если один IP сделал 5 плохих попыток...
-findtime = 60                          # ...в течение всего 60 секунд...
-bantime  = 3600                        # ...полностью заблокировать ему доступ к серверу на 1 час. 
-```
-
-После применения изменений перезапустите службу:
+Открываем параллельную вкладку терминала под `root` и перезаписываем протухшую лицензию новым «вечным» ключом до марта 2027 года:
 
 ```bash
-sudo systemctl restart fail2ban
+nano /sybase/NPL/SYSAM-2_0/licenses/SYBASE_ASE_TestDrive.lic
+```
+
+> Удаляем старый текст через `Ctrl+K` и вставляем актуальный ключ до 2027 года.
+
+Чтобы инсталлятор при повторном запуске случайно не перетер наш файл старым шаблоном, вешаем на него железный замок ядра Linux (атрибут `immutable`):
+
+```bash
+chmod 755 /sybase/NPL/SYSAM-2_0/licenses/SYBASE_ASE_TestDrive.lic
+chown sybnpl:sapsys /sybase/NPL/SYSAM-2_0/licenses/SYBASE_ASE_TestDrive.lic
+chattr +i /sybase/NPL/SYSAM-2_0/licenses/SYBASE_ASE_TestDrive.lic
+```
+
+Возвращаемся в первое окно и запускаем `./install.sh` заново. Инсталлятор подхватит сессию, база Sybase ASE успешно прочитает валидную лицензию на текущем времени 2026 года и выдаст финальный заветный статус:
+
+```text
+Installation of NPL successful
 ```
 
 ---
 
-## Линия обороны 4. Системная гигиена и расширенная защита
+## Проверка работоспособности системы
 
-Дополнительные шаги для изоляции критических узлов операционной системы:
-
-1. **Отключение IPv6:** Если инфраструктура полностью работает на IPv4, рекомендуется отключить сетевой протокол IPv6 в настройках ОС, чтобы избежать ситуации, когда правила Fail2ban или лимиты Nginx обрабатывают только IPv4-трафик, оставляя IPv6 без контроля.
-2. **Изоляция базы данных:** Порты СУБД должны быть закрыты для внешних подключений. Доступ к базе данных извне должен осуществляться исключительно через защищенные SSH-туннели.
-
-### Продвинутые инструменты автоматизации
-
-* **Секретный стук (Port Knocking):** Позволяет сделать порт управления SSH полностью закрытым для внешних сканеров, пока администратор не отправит строго определенную последовательность пакетов на скрытые порты.
-* **Автоматические черные списки IP:** Использование утилиты `ipset` для мгновенной обработки списков вредоносных IP-адресов без избыточной нагрузки на CPU.
-
-#### Скрипт автоматического обновления черных списков (/usr/local/bin/update_blacklist.sh)
+Переключаемся на системного администратора SAP:
 
 ```bash
-#!/bin/bash
-
-# Скачиваем свежий список плохих IP
-curl -s "https://githubusercontent.com" -o /tmp/blacklist.txt
-
-# Создаем новый список (если существует - удаляем)
-ipset destroy blacklist 2>/dev/null
-ipset create blacklist hash:ip
-
-# Добавляем IP в список
-while read ip; do
-    # Пропускаем комментарии и пустые строки
-    [[ -z "$ip" || "$ip" == \#* ]] && continue
-    ipset add blacklist "$ip" 2>/dev/null
-done < /tmp/blacklist.txt
-
-# Удаляем временный файл
-rm -f /tmp/blacklist.txt
-
-echo "Готово! Заблокировано IP: $(ipset list blacklist | grep -c '^[0-9]')"
+su - npladm
 ```
 
-Для блокировки пакетов из этого списка на уровне ядра выполните команду:
+И запрашиваем официальный статус процессов инстанса `00`:
 
 ```bash
-sudo iptables -I INPUT -m set --match-set blacklist src -j DROP 
+sapcontrol -prot NI_HTTP -host 127.0.0.1 -nr 00 -function GetProcessList
 ```
 
-Для регулярного обновления списка добавьте задачу в планировщик `crontab -e`:
+Вся пачка процессов намертво горит статусом **GREEN, Running**:
 
-```cron
-# Обновлять список каждый день в 3:00
-0 3 * * * /usr/local/bin/update_blacklist.sh > /dev/null 2>&1
+| Процесс | Описание | Статус |
+|---|---|---|
+| `disp+work` | Dispatcher (Сердце системы) | 🟢 GREEN |
+| `igswd_mt` | IGS Watchdog (Графика) | 🟢 GREEN |
+| `gwrd` | Gateway (Шлюз RFC) | 🟢 GREEN |
+| `icman` | ICM (Интернет-менеджер) | 🟢 GREEN |
+
+---
+
+## Настройка графического интерфейса (SAP GUI) на Ubuntu
+
+Поскольку я сижу на Ubuntu, обычный Windows-клиент (`.exe`) не подойдет. Используем кроссплатформенный **SAP GUI for Java**. Его инсталлятор уже заботливо извлечен в папку нашего дистрибутива `/root/sap/client/JavaGUI/`!
+
+1. Открываем терминал на своей Ubuntu и скачиваем папку инсталлятора с сервера по SCP:
+   ```bash
+   scp -r root@192.168.122.232:/root/sap/client/JavaGUI/ ~/JavaGUI/
+   ```
+2. Устанавливаем на ноутбук среду Java.
+3. Заходим в скачанную папку и запускаем установку клиента:
+   ```bash
+   java -jar PlatinGUI750_5-80002496.jar
+   ```
+4. Запускаем установленный **SAP Logon** из меню приложений Ubuntu, создаем новое подключение, переходим во вкладку **Advanced**, ставим галочку **«Use expert configuration»** и прописываем строку подключения в один клик:
+   ```text
+   conn=/H/192.168.122.232/S/3200
+   ```
+
+Дважды кликаем по строке — и мы у цели! Заходим под:
+
+| Параметр | Значение |
+|---|---|
+| Client | `000` |
+| User | `SAP*` |
+| Password | `Ваш_Мастер_Пароль` |
+
+---
+
+## Шпаргалка по управлению ландшафтом
+
+Все операции по запуску и остановке выполняются строго под пользователем `npladm` (`su - npladm`).
+
+### Корректное выключение (Полный стоп)
+
+```bash
+# Гасим основной сервер приложений (инстанс 00)
+sapcontrol -prot NI_HTTP -nr 00 -function StopSystem ALL
+
+# Гасим центральные службы ASCS и СУБД Sybase ASE (инстанс 01)
+sapcontrol -prot NI_HTTP -nr 01 -function StopSystem ALL
+
+# Выметаем остатки сегментов Shared Memory из ОЗУ Linux
+cleanipc 00 remove
+cleanipc 01 remove
 ```
 
-Правильная и последовательная настройка базовых механизмов операционной системы и веб-сервера позволяет нейтрализовать большинство автоматизированных угроз и защитить веб-ресурс без затрат на дорогостоящие коммерческие лицензии.
+> После этого пишем `exit` под рута и безопасно тушим саму виртуалку командой `poweroff`.
+
+### Корректное включение (Полный старт)
+
+```bash
+# Стартуем службы ASCS и базу данных Sybase (инстанс 01)
+sapcontrol -prot NI_HTTP -nr 01 -function StartSystem ALL
+
+# Стартуем сервер приложений NetWeaver (инстанс 00)
+sapcontrol -prot NI_HTTP -nr 00 -function StartSystem ALL
+
+# Через 40 секунд проверяем статус процессов
+sapcontrol -prot NI_HTTP -host 127.0.0.1 -nr 00 -function GetProcessList
+```
+
+---
+
+## Заключение
+
+Этот запуск отнял у меня огромное количество времени и ресурсов на раскопки логов и чтение ИТ-форумов и ИИ. Искренне надеюсь, что этот собранный по крупицам мануал сэкономит кому-то кучу часов и окажется по-настоящему полезным.
+
+---
+
+## Полезные ссылки
+
+- [SAP Trials & Downloads](https://www.sap.com/products/try-sap/trials-downloads.html)
