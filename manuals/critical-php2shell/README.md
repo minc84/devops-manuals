@@ -65,7 +65,7 @@ Installed: php-devel.x86_64 0:7.0.33-42.el7.remi ... Complete!
 Клонируем исходный код из официального репозитория разработчика. Обратите внимание: утилиту `phpize` и компиляцию нужно запускать строго внутри подпапки `src`, где находится файл `config.m4`:
 
 ```bash
-git clone https://github.com/hostedpower/php_uploadprogress_guard.git
+git clone https://github.com/HOSTED-POWER/php_uploadprogress_guard.git
 cd hp_uploadprogress_guard/src
 phpize && ./configure && make && sudo make install
 ```
